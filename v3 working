@@ -1,0 +1,368 @@
+# motion_programmer.py
+# GUI: manual controls + editable sequence table + start/stop (repeat forever)
+# Requires: adafruit_servokit
+import tkinter as tk
+from tkinter import ttk, messagebox
+from adafruit_servokit import ServoKit
+import threading
+import time
+
+# ------------------ Hardware setup (same as your working code) ------------------
+kit = ServoKit(channels=16)
+
+# Servo channels
+BASE = 0
+THIGH = 1
+INDEFECTOR = 2
+GRIPPER = 3
+
+# Default neutral angle
+NEUTRAL_ANGLE = 90
+
+# Track current angle
+current_angle = {
+    BASE: NEUTRAL_ANGLE,
+    THIGH: NEUTRAL_ANGLE,
+    INDEFECTOR: NEUTRAL_ANGLE,
+    GRIPPER: NEUTRAL_ANGLE
+}
+
+# Initialize servos to neutral (safe)
+for ch in current_angle:
+    try:
+        kit.servo[ch].angle = NEUTRAL_ANGLE
+    except Exception:
+        pass
+
+# ------------------ Movement primitives ------------------
+# threaded (non-blocking) pulse used by manual buttons (keeps original behavior)
+def pulse_servo(channel, step, duration=0.2):
+    """Non-blocking: Move servo a single step and return to current position (threaded)."""
+    def move():
+        target = max(0, min(180, current_angle[channel] + step))
+        kit.servo[channel].angle = target
+        time.sleep(duration / 2)
+        kit.servo[channel].angle = current_angle[channel]
+        time.sleep(duration / 2)
+        # update stored angle (ensure it's the center again)
+        # current_angle[channel] stays as it was by design (we pulse relative)
+    threading.Thread(target=move, daemon=True).start()
+
+# blocking pulse used by sequence runner (ensures deterministic sequential execution)
+def pulse_servo_blocking(channel, step, duration=0.2):
+    """Blocking: move servo a single step then return (synchronous)."""
+    target = max(0, min(180, current_angle[channel] + step))
+    kit.servo[channel].angle = target
+    time.sleep(duration / 2)
+    kit.servo[channel].angle = current_angle[channel]
+    time.sleep(duration / 2)
+    # keep current_angle unchanged (same semantics as your original pulse)
+
+# normal setter for sliders
+def set_servo_angle(channel, angle):
+    angle = max(0, min(180, int(angle)))
+    kit.servo[channel].angle = angle
+    current_angle[channel] = angle
+
+# ------------------ GUI ------------------
+root = tk.Tk()
+root.title("Motion Programmer — Manual + Sequence")
+
+# ---------- Manual controls (sliders + pulse buttons) ----------
+topframe = tk.Frame(root)
+topframe.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
+
+tk.Label(topframe, text="Manual Controls").grid(row=0, column=0, columnspan=4)
+
+def create_slider(parent, row, label_text, channel):
+    tk.Label(parent, text=label_text).grid(row=row, column=0, padx=5, pady=3, sticky="w")
+    slider = tk.Scale(parent, from_=0, to=180, orient=tk.HORIZONTAL,
+                      command=lambda val, ch=channel: set_servo_angle(ch, val), length=300)
+    slider.set(NEUTRAL_ANGLE)
+    slider.grid(row=row, column=1, columnspan=3, padx=5, pady=3)
+    return slider
+
+base_slider = create_slider(topframe, 1, "Base", BASE)
+thigh_slider = create_slider(topframe, 2, "Thigh", THIGH)
+indef_slider = create_slider(topframe, 3, "Indefector", INDEFECTOR)
+gripper_slider = create_slider(topframe, 4, "Gripper", GRIPPER)
+
+# Speed slider for manual pulses (ms)
+tk.Label(topframe, text="Manual Pulse Duration (ms)").grid(row=5, column=0, padx=5, pady=6, sticky="w")
+speed_slider = tk.Scale(topframe, from_=50, to=1000, orient=tk.HORIZONTAL)
+speed_slider.set(200)
+speed_slider.grid(row=5, column=1, columnspan=3, padx=5, pady=6, sticky="ew")
+
+# Button helper (keeps your original labels and step directions)
+def create_pulse_button(parent, text, channel, step, row, col):
+    btn = tk.Button(parent, text=text, width=12,
+                    command=lambda ch=channel, st=step: pulse_servo(ch, st, duration=speed_slider.get()/1000))
+    btn.grid(row=row, column=col, padx=4, pady=4)
+    # also support press+hold -> originally you used continuous; keep simple clicking for manual
+    return btn
+
+# Row of manual pulse buttons
+btnframe = tk.Frame(root)
+btnframe.grid(row=1, column=0, padx=6, pady=6, sticky="ew")
+
+tk.Label(btnframe, text="Pulse Buttons").grid(row=0, column=0, columnspan=4)
+# Using doubled-step values like you used earlier is optional; keep defaults moderate
+create_pulse_button(btnframe, "Base Left", BASE, -24, 1, 0)
+create_pulse_button(btnframe, "Base Right", BASE, +20, 1, 1)
+create_pulse_button(btnframe, "Thigh Down", THIGH, +20, 1, 2)
+create_pulse_button(btnframe, "Thigh Up", THIGH, -24, 1, 3)
+create_pulse_button(btnframe, "Indefector Up", INDEFECTOR, +20, 2, 0)
+create_pulse_button(btnframe, "Indefector Down", INDEFECTOR, -24, 2, 1)
+create_pulse_button(btnframe, "Gripper Front", GRIPPER, +20, 2, 2)
+create_pulse_button(btnframe, "Gripper Back", GRIPPER, -20, 2, 3)
+
+# ---------------- Sequence editor (Option B: editable grid) ----------------
+seq_frame = tk.LabelFrame(root, text="Sequence Editor (editable cells)")
+seq_frame.grid(row=2, column=0, padx=6, pady=6, sticky="nsew")
+
+# Treeview for steps
+cols = ("motor", "direction", "step", "count", "duration_ms")
+tree = ttk.Treeview(seq_frame, columns=cols, show="headings", selectmode="browse", height=8)
+tree.heading("motor", text="Motor")
+tree.heading("direction", text="Direction")
+tree.heading("step", text="Step (deg)")
+tree.heading("count", text="Count")
+tree.heading("duration_ms", text="Duration (ms)")
+
+tree.column("motor", width=100, anchor="center")
+tree.column("direction", width=100, anchor="center")
+tree.column("step", width=80, anchor="center")
+tree.column("count", width=80, anchor="center")
+tree.column("duration_ms", width=100, anchor="center")
+
+tree.grid(row=0, column=0, columnspan=6, padx=6, pady=6, sticky="nsew")
+
+# scroll
+scroll = ttk.Scrollbar(seq_frame, orient="vertical", command=tree.yview)
+tree.configure(yscroll=scroll.set)
+scroll.grid(row=0, column=6, sticky="ns")
+
+# default motor & directions lists
+MOTOR_LIST = ["Base", "Thigh", "Indefector", "Gripper"]
+DIRECTION_MAP = {
+    "Base": ["Left", "Right"],
+    "Thigh": ["Up", "Down"],
+    "Indefector": ["Up", "Down"],
+    "Gripper": ["Front", "Back"]
+}
+
+# Insert helper with defaults
+def add_row_defaults():
+    tree.insert("", "end", values=("Base", "Left", "10", "10", "300"))
+
+# Buttons to add/remove rows
+def add_row():
+    tree.insert("", "end", values=("Base", "Left", "10", "1", "300"))
+
+def delete_selected():
+    sel = tree.selection()
+    if not sel:
+        return
+    for s in sel:
+        tree.delete(s)
+
+def clear_all():
+    for i in tree.get_children():
+        tree.delete(i)
+
+btn_add = tk.Button(seq_frame, text="Add Row", command=add_row)
+btn_add.grid(row=1, column=0, padx=4, pady=6, sticky="w")
+btn_delete = tk.Button(seq_frame, text="Delete Selected", command=delete_selected)
+btn_delete.grid(row=1, column=1, padx=4, pady=6, sticky="w")
+btn_clear = tk.Button(seq_frame, text="Clear All", command=clear_all)
+btn_clear.grid(row=1, column=2, padx=4, pady=6, sticky="w")
+btn_add_defaults = tk.Button(seq_frame, text="Add Example", command=add_row_defaults)
+btn_add_defaults.grid(row=1, column=3, padx=4, pady=6, sticky="w")
+
+# Make cells editable: double-click to edit value (simple popup)
+def on_double_click(event):
+    item = tree.identify_row(event.y)
+    col = tree.identify_column(event.x)
+    if not item or not col:
+        return
+    col_idx = int(col.replace("#", "")) - 1
+    x, y, width, height = tree.bbox(item, col)
+    value = tree.set(item, column=cols[col_idx])
+
+    # popup entry
+    edit = tk.Toplevel(root)
+    edit.wm_overrideredirect(True)
+    edit.geometry(f"{width}x{height}+{tree.winfo_rootx()+x}+{tree.winfo_rooty()+y}")
+
+    e = tk.Entry(edit)
+    e.insert(0, value)
+    e.pack(fill="both", expand=True)
+    e.focus_set()
+
+    def save_edit(event=None):
+        new = e.get()
+        # basic validation for numeric columns
+        if cols[col_idx] in ("step", "count", "duration_ms"):
+            try:
+                float(new)
+            except Exception:
+                messagebox.showerror("Invalid", f"{cols[col_idx]} must be numeric")
+                edit.destroy()
+                return
+        # for motor column, ensure value is valid
+        if cols[col_idx] == "motor" and new not in MOTOR_LIST:
+            messagebox.showerror("Invalid", f"Motor must be one of {MOTOR_LIST}")
+            edit.destroy()
+            return
+        # for direction col, ensure it's valid for motor
+        if cols[col_idx] == "direction":
+            motor = tree.set(item, "motor")
+            allowed = DIRECTION_MAP.get(motor, [])
+            if new not in allowed:
+                messagebox.showerror("Invalid", f"Direction must be one of {allowed} for motor {motor}")
+                edit.destroy()
+                return
+
+        tree.set(item, column=cols[col_idx], value=new)
+        edit.destroy()
+
+    e.bind("<Return>", save_edit)
+    e.bind("<FocusOut>", lambda ev=None: edit.destroy())
+
+tree.bind("<Double-1>", on_double_click)
+
+# ---------------- Sequence runner ----------------
+stop_event = threading.Event()
+sequence_thread = None
+
+# helper: map motor name to channel
+def motor_to_channel(name):
+    return {"Base": BASE, "Thigh": THIGH, "Indefector": INDEFECTOR, "Gripper": GRIPPER}[name]
+
+# direction sign helper
+def direction_sign(motor_name, direction_name):
+    # Left/Up -> -1, Right/Down -> +1, Front -> +1, Back -> -1 (matches prior conventions)
+    if direction_name in ("Left", "Back", "Up"):
+        return -1
+    else:
+        return 1
+
+def run_sequence_thread(wait_time_s):
+    while not stop_event.is_set():
+        # iterate rows top->bottom
+        items = tree.get_children()
+        if not items:
+            time.sleep(0.2)
+            continue
+        for iid in items:
+            if stop_event.is_set():
+                break
+            vals = tree.item(iid, "values")
+            # vals: motor, direction, step, count, duration_ms
+            motor, direction, step_s, count_s, duration_ms_s = vals
+            try:
+                step = float(step_s)
+                count = int(float(count_s))
+                duration = float(duration_ms_s) / 1000.0
+            except Exception:
+                print("Skipping invalid row:", vals)
+                continue
+            ch = motor_to_channel(motor)
+            sign = direction_sign(motor, direction)
+            signed_step = sign * step
+
+            for _ in range(count):
+                if stop_event.is_set():
+                    break
+                # blocking pulse so sequence is deterministic
+                pulse_servo_blocking(ch, signed_step, duration=duration)
+            # tiny safety gap
+            time.sleep(0.01)
+        # Wait after full sequence
+        for _ in range(int(max(0, wait_time_s))):
+            if stop_event.is_set():
+                break
+            time.sleep(1)
+        # If non-integer wait requested, sleep fractional part
+        frac = wait_time_s - int(wait_time_s)
+        if frac > 0 and not stop_event.is_set():
+            time.sleep(frac)
+
+    print("Sequence thread exiting")
+
+def start_sequence():
+    global sequence_thread
+    if sequence_thread and sequence_thread.is_alive():
+        messagebox.showinfo("Sequence", "Sequence already running")
+        return
+    stop_event.clear()
+    try:
+        wait_time_s = float(wait_entry.get())
+    except Exception:
+        messagebox.showerror("Invalid", "Loop Wait must be numeric (seconds)")
+        return
+    sequence_thread = threading.Thread(target=run_sequence_thread, args=(wait_time_s,), daemon=True)
+    sequence_thread.start()
+    print("Sequence started")
+
+def stop_sequence():
+    stop_event.set()
+    print("Stopping sequence...")
+
+# UI controls for sequence start/stop and wait
+ctrl_frame = tk.Frame(root)
+ctrl_frame.grid(row=3, column=0, padx=6, pady=6, sticky="ew")
+
+tk.Label(ctrl_frame, text="Loop Wait (s)").grid(row=0, column=0, padx=4, pady=4)
+wait_entry = tk.Entry(ctrl_frame, width=8)
+wait_entry.insert(0, "10")
+wait_entry.grid(row=0, column=1, padx=4, pady=4)
+
+btn_start = tk.Button(ctrl_frame, text="Start Sequence (repeat)", command=start_sequence, bg="#4CAF50", fg="white")
+btn_start.grid(row=0, column=2, padx=6, pady=4)
+
+btn_stop = tk.Button(ctrl_frame, text="Stop Sequence", command=stop_sequence, bg="#F44336", fg="white")
+btn_stop.grid(row=0, column=3, padx=6, pady=4)
+
+# Helper: Save/Load sequence to/from simple CSV
+def save_sequence():
+    import csv, filedialog
+    path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV","*.csv")])
+    if not path:
+        return
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        for iid in tree.get_children():
+            w.writerow(tree.item(iid, "values"))
+    messagebox.showinfo("Saved", f"Sequence saved to {path}")
+
+def load_sequence():
+    import csv, filedialog
+    path = filedialog.askopenfilename(filetypes=[("CSV","*.csv")])
+    if not path:
+        return
+    clear_all()
+    with open(path, newline="") as f:
+        r = csv.reader(f)
+        for row in r:
+            if len(row) >= 5:
+                tree.insert("", "end", values=(row[0], row[1], row[2], row[3], row[4]))
+    messagebox.showinfo("Loaded", f"Sequence loaded from {path}")
+
+btn_save = tk.Button(ctrl_frame, text="Save Seq", command=save_sequence)
+btn_save.grid(row=0, column=4, padx=6, pady=4)
+btn_load = tk.Button(ctrl_frame, text="Load Seq", command=load_sequence)
+btn_load.grid(row=0, column=5, padx=6, pady=4)
+
+# Add a helpful example sequence on startup
+add_row_defaults()
+
+# Make GUI expand properly
+root.grid_rowconfigure(2, weight=1)
+root.grid_columnconfigure(0, weight=1)
+seq_frame.grid_rowconfigure(0, weight=1)
+seq_frame.grid_columnconfigure(0, weight=1)
+
+# Start GUI
+root.protocol("WM_DELETE_WINDOW", lambda: (stop_sequence(), root.destroy()))
+root.mainloop()
